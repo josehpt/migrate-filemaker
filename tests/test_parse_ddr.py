@@ -286,43 +286,53 @@ _MANAGER_ACCESS = {
     "value_lists": {"value": "ViewOnly", "allow_creation": "False"},
 }
 
+_FULL_ACCESS_ATTRS = {
+    "id": "1",
+    "menu": "All",
+    "printing": "True",
+    "exporting": "True",
+    "idleDisconnect": "False",
+    "manageAccounts": "True",
+    "managedExtended": "True",
+    "allowModifyPassword": "True",
+    "overrideValidationWarning": "True",
+    "comment": "access to everything",
+}
+
+_MANAGER_ATTRS = {
+    "id": "2",
+    "menu": "All",
+    "printing": "True",
+    "exporting": "True",
+    "idleDisconnect": "True",
+    "manageAccounts": "False",
+    "managedExtended": "False",
+    "allowModifyPassword": "True",
+    "overrideValidationWarning": "False",
+    "comment": "",
+}
+
 EXPECTED_PRIVILEGES = [
     dict(
         {
-            "id": "1",
             "name": "[Full Access]",
-            "menu": "All",
-            "printing": "True",
-            "exporting": "True",
-            "idleDisconnect": "False",
-            "manageAccounts": "True",
-            "managedExtended": "True",
-            "allowModifyPassword": "True",
-            "overrideValidationWarning": "True",
-            "comment": "access to everything",
             "source_files": [SRC],
+            "attrs_by_file": {SRC: _FULL_ACCESS_ATTRS},
             "access_by_file": {SRC: _FULL_ACCESS_ACCESS},
             "access_source_file": SRC,
         },
+        **_FULL_ACCESS_ATTRS,
         **_FULL_ACCESS_ACCESS,
     ),
     dict(
         {
-            "id": "2",
             "name": "Manager",
-            "menu": "All",
-            "printing": "True",
-            "exporting": "True",
-            "idleDisconnect": "True",
-            "manageAccounts": "False",
-            "managedExtended": "False",
-            "allowModifyPassword": "True",
-            "overrideValidationWarning": "False",
-            "comment": "",
             "source_files": [SRC],
+            "attrs_by_file": {SRC: _MANAGER_ATTRS},
             "access_by_file": {SRC: _MANAGER_ACCESS},
             "access_source_file": SRC,
         },
+        **_MANAGER_ATTRS,
         **_MANAGER_ACCESS,
     ),
 ]
@@ -510,7 +520,8 @@ class GoldenFixtureTest(unittest.TestCase):
         The RBAC design was then built from hide formulas instead."""
         manager = next(p for p in self.results["privileges"] if p["name"] == "Manager")
         self.assertNotEqual(
-            set(manager) - {"source_files", "access_by_file", "access_source_file"},
+            set(manager) - {"source_files", "attrs_by_file", "access_by_file",
+                            "access_source_file"},
             {"id", "name"},
             "privilege set emitted as bare {id, name} -- this is D4",
         )
@@ -682,6 +693,67 @@ class GoldenFixtureTest(unittest.TestCase):
                 if step["id"] == step_id:
                     return step
         self.fail(f"step {step_id} missing from fixture output")
+
+
+class _StubDDR:
+    """The slice of DDRFile that merge_security reads. The fixture is one file,
+    so it cannot show what happens when two files share a privilege-set name."""
+
+    def __init__(self, source_file, privileges):
+        self.source_file = source_file
+        self.accounts = []
+        self.external_data_sources = []
+        self.privileges = [dict(p, source_file=source_file) for p in privileges]
+
+
+class MultiFileSecurityMergeTest(unittest.TestCase):
+    """merge_security used to take a privilege set's id and flags from the first
+    file and its access blocks plus access_source_file from the richest one. The
+    top-level record then matched no file: in a real six-file DDR a set that is
+    id="10" allowModifyPassword="True" in the file named by access_source_file
+    came out as id 11, allowModifyPassword False -- the first file's values."""
+
+    UI = "A.fmp12"    # sorts first, coarse grant
+    DATA = "B.fmp12"  # the real model
+
+    UI_SET = {"id": "11", "name": "SetX", "allowModifyPassword": "False", "menu": "Minimal",
+              "records": {"value": "CreateEditDelete"}}
+    DATA_SET = {"id": "10", "name": "SetX", "allowModifyPassword": "True", "menu": "All",
+                "records": {"value": "Custom", "tables": [{"name": "T1"}, {"name": "T2"}]}}
+
+    def _merge(self, *files):
+        _, privileges = parse_ddr.DDRMerger(list(files)).merge_security()
+        self.assertEqual(len(privileges), 1)
+        return privileges[0]
+
+    def test_top_level_id_and_flags_come_from_access_source_file(self):
+        p = self._merge(_StubDDR(self.UI, [self.UI_SET]), _StubDDR(self.DATA, [self.DATA_SET]))
+        self.assertEqual(p["access_source_file"], self.DATA)
+        self.assertEqual((p["id"], p["allowModifyPassword"], p["menu"]), ("10", "True", "All"))
+        self.assertEqual(p["records"], self.DATA_SET["records"])
+
+    def test_every_files_id_and_flags_are_kept(self):
+        p = self._merge(_StubDDR(self.UI, [self.UI_SET]), _StubDDR(self.DATA, [self.DATA_SET]))
+        self.assertEqual(p["attrs_by_file"], {
+            self.UI: {"id": "11", "allowModifyPassword": "False", "menu": "Minimal"},
+            self.DATA: {"id": "10", "allowModifyPassword": "True", "menu": "All"},
+        })
+
+    def test_top_level_does_not_depend_on_file_order(self):
+        forward = self._merge(_StubDDR(self.UI, [self.UI_SET]), _StubDDR(self.DATA, [self.DATA_SET]))
+        reverse = self._merge(_StubDDR(self.DATA, [self.DATA_SET]), _StubDDR(self.UI, [self.UI_SET]))
+        for key in ("id", "allowModifyPassword", "menu", "records", "access_source_file"):
+            self.assertEqual(forward[key], reverse[key], key)
+
+    def test_same_name_without_access_keeps_both_files_flags(self):
+        """Two files with an unrelated [Guest], same id, different flags."""
+        a = {"id": "4", "name": "[Guest]", "printing": "False"}
+        b = {"id": "4", "name": "[Guest]", "printing": "True"}
+        p = self._merge(_StubDDR(self.UI, [a]), _StubDDR(self.DATA, [b]))
+        self.assertEqual(p["attrs_by_file"][self.UI]["printing"], "False")
+        self.assertEqual(p["attrs_by_file"][self.DATA]["printing"], "True")
+        self.assertEqual(p["access_source_file"], self.UI)
+        self.assertEqual(p["printing"], "False")
 
 
 if __name__ == "__main__":

@@ -1406,6 +1406,13 @@ class DDRMerger:
         Deduping by name and keeping the first occurrence therefore discards the
         authorization model outright -- the files sort UI-first. Dedup on
         identity, but keep every file's access block under `access_by_file`.
+
+        The id and flags (menu, printing, allowModifyPassword, ...) are per file
+        too: the same name carries a different id, and can carry different
+        flags, in each file. They are kept under `attrs_by_file`. The top level
+        is ONE file's complete record -- id, flags and access all from
+        `access_source_file`. Taking the id and flags from the first file and the
+        access from another produced a record no file actually contains.
         """
         all_accounts = []
         for ddr in self.files:
@@ -1416,34 +1423,38 @@ class DDRMerger:
             for p in ddr.privileges:
                 name = p["name"]
                 access = {k: p[k] for k in self._ACCESS_KEYS if k in p}
+                attrs = {k: v for k, v in p.items()
+                         if k not in self._ACCESS_KEYS and k not in ("name", "source_file")}
 
                 if name not in priv_by_name:
-                    entry = {k: v for k, v in p.items() if k not in self._ACCESS_KEYS}
-                    entry["source_files"] = [ddr.source_file]
-                    entry.pop("source_file", None)
-                    entry["access_by_file"] = {}
-                    priv_by_name[name] = entry
-                else:
-                    entry = priv_by_name[name]
-                    if ddr.source_file not in entry["source_files"]:
-                        entry["source_files"].append(ddr.source_file)
-
+                    priv_by_name[name] = {
+                        "name": name,
+                        "source_files": [],
+                        "attrs_by_file": {},
+                        "access_by_file": {},
+                    }
+                entry = priv_by_name[name]
+                if ddr.source_file not in entry["source_files"]:
+                    entry["source_files"].append(ddr.source_file)
+                entry["attrs_by_file"][ddr.source_file] = attrs
                 if access:
-                    priv_by_name[name]["access_by_file"][ddr.source_file] = access
+                    entry["access_by_file"][ddr.source_file] = access
 
         # Surface the richest definition at the top level for convenience: the
         # one that actually enumerates tables. Consumers wanting per-file detail
-        # read access_by_file.
+        # read attrs_by_file and access_by_file.
         for entry in priv_by_name.values():
             best = None
             for source_file, access in entry["access_by_file"].items():
                 tables = (access.get("records") or {}).get("tables")
                 if tables and (best is None or len(tables) > best[1]):
                     best = (source_file, len(tables))
-            chosen = best[0] if best else next(iter(entry["access_by_file"]), None)
-            if chosen:
-                entry.update(entry["access_by_file"][chosen])
-                entry["access_source_file"] = chosen
+            chosen = (best[0] if best
+                      else next(iter(entry["access_by_file"]), None)
+                      or entry["source_files"][0])
+            entry.update(entry["attrs_by_file"][chosen])
+            entry.update(entry["access_by_file"].get(chosen, {}))
+            entry["access_source_file"] = chosen
 
         return all_accounts, list(priv_by_name.values())
 
